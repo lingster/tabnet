@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import List, Any, Dict
+from contextlib import nullcontext
 import torch
 from torch.nn.utils import clip_grad_norm_
 import numpy as np
@@ -7,17 +8,17 @@ from scipy.sparse import csc_matrix
 from abc import abstractmethod
 from pytorch_tabnet import tab_network
 from pytorch_tabnet.utils import (
-    SparsePredictDataset,
-    PredictDataset,
     create_explain_matrix,
     validate_eval_set,
     create_dataloaders,
+    create_predict_dataloader,
     define_device,
     ComplexEncoder,
     check_input,
     check_warm_start,
     create_group_matrix,
-    check_embedding_parameters
+    check_embedding_parameters,
+    to_numpy,
 )
 from pytorch_tabnet.callbacks import (
     CallbackContainer,
@@ -28,7 +29,6 @@ from pytorch_tabnet.callbacks import (
 from pytorch_tabnet.metrics import MetricContainer, check_metrics
 from sklearn.base import BaseEstimator
 
-from torch.utils.data import DataLoader
 import io
 import json
 from pathlib import Path
@@ -36,7 +36,6 @@ import shutil
 import zipfile
 import warnings
 import copy
-import scipy
 
 
 @dataclass
@@ -65,7 +64,12 @@ class TabModel(BaseEstimator):
     mask_type: str = "sparsemax"
     input_dim: int = None
     output_dim: int = None
-    device_name: str = "auto"
+    device_name: str = "cuda"
+    require_cuda: bool = True
+    use_amp: bool = True
+    amp_dtype: str = "auto"
+    allow_tf32: bool = True
+    cudnn_benchmark: bool = True
     n_shared_decoder: int = 1
     n_indep_decoder: int = 1
     grouped_features: List[List[int]] = field(default_factory=list)
@@ -74,12 +78,19 @@ class TabModel(BaseEstimator):
         # These are default values needed for saving model
         self.batch_size = 1024
         self.virtual_batch_size = 128
+        self.num_workers = 0
 
         torch.manual_seed(self.seed)
         # Defining device
-        self.device = torch.device(define_device(self.device_name))
+        self.device = torch.device(
+            define_device(self.device_name, require_cuda=self.require_cuda)
+        )
         if self.verbose != 0:
             warnings.warn(f"Device used : {self.device}")
+
+        self.pin_memory = self.device.type != "cpu"
+        self._configure_torch_backend()
+        self._setup_amp()
 
         # create deep copies of mutable parameters
         self.optimizer_fn = copy.deepcopy(self.optimizer_fn)
@@ -119,6 +130,43 @@ class TabModel(BaseEstimator):
                         exec(f"self.{var_name} = value")
                 except AttributeError:
                     exec(f"self.{var_name} = value")
+
+    def _configure_torch_backend(self):
+        if self.device.type != "cuda":
+            return
+        torch.backends.cuda.matmul.allow_tf32 = self.allow_tf32
+        torch.backends.cudnn.allow_tf32 = self.allow_tf32
+        torch.backends.cudnn.benchmark = self.cudnn_benchmark
+        if hasattr(torch, "set_float32_matmul_precision"):
+            precision = "high" if self.allow_tf32 else "highest"
+            torch.set_float32_matmul_precision(precision)
+
+    def _resolve_amp_dtype(self):
+        if not self.use_amp or self.device.type != "cuda":
+            return None
+        if isinstance(self.amp_dtype, torch.dtype):
+            return self.amp_dtype
+        amp_choice = str(self.amp_dtype).lower()
+        if amp_choice in ("auto", "bf16", "bfloat16"):
+            if torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+            if amp_choice != "auto":
+                raise ValueError("bfloat16 requested but not supported by this GPU.")
+            return torch.float16
+        if amp_choice in ("fp16", "float16"):
+            return torch.float16
+        raise ValueError(f"Unsupported amp_dtype: {self.amp_dtype}")
+
+    def _setup_amp(self):
+        self.use_amp = bool(self.use_amp and self.device.type == "cuda")
+        self._amp_dtype = self._resolve_amp_dtype()
+        enable_scaler = self.use_amp and self._amp_dtype == torch.float16
+        self._grad_scaler = torch.cuda.amp.GradScaler(enabled=enable_scaler)
+
+    def _autocast_context(self):
+        if self.use_amp and self.device.type == "cuda":
+            return torch.autocast(device_type="cuda", dtype=self._amp_dtype)
+        return nullcontext()
 
     def fit(
         self,
@@ -293,25 +341,24 @@ class TabModel(BaseEstimator):
         """
         self.network.eval()
 
-        if scipy.sparse.issparse(X):
-            dataloader = DataLoader(
-                SparsePredictDataset(X),
-                batch_size=self.batch_size,
-                shuffle=False,
-            )
-        else:
-            dataloader = DataLoader(
-                PredictDataset(X),
-                batch_size=self.batch_size,
-                shuffle=False,
-            )
+        dataloader = create_predict_dataloader(
+            X,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            device=self.device,
+        )
 
         results = []
-        for batch_nb, data in enumerate(dataloader):
-            data = data.to(self.device).float()
-            output, M_loss = self.network(data)
-            predictions = output.cpu().detach().numpy()
-            results.append(predictions)
+        with torch.inference_mode():
+            for batch_nb, data in enumerate(dataloader):
+                data = data.to(self.device, non_blocking=True)
+                if data.dtype != torch.float32:
+                    data = data.float()
+                with self._autocast_context():
+                    output, _ = self.network(data)
+                predictions = output.cpu().detach().numpy()
+                results.append(predictions)
         res = np.vstack(results)
         return self.predict_func(res)
 
@@ -335,38 +382,37 @@ class TabModel(BaseEstimator):
         """
         self.network.eval()
 
-        if scipy.sparse.issparse(X):
-            dataloader = DataLoader(
-                SparsePredictDataset(X),
-                batch_size=self.batch_size,
-                shuffle=False,
-            )
-        else:
-            dataloader = DataLoader(
-                PredictDataset(X),
-                batch_size=self.batch_size,
-                shuffle=False,
-            )
+        dataloader = create_predict_dataloader(
+            X,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            device=self.device,
+        )
 
         res_explain = []
 
-        for batch_nb, data in enumerate(dataloader):
-            data = data.to(self.device).float()
-
-            M_explain, masks = self.network.forward_masks(data)
-            for key, value in masks.items():
-                masks[key] = csc_matrix.dot(
-                    value.cpu().detach().numpy(), self.reducing_matrix
-                )
-            original_feat_explain = csc_matrix.dot(M_explain.cpu().detach().numpy(),
-                                                   self.reducing_matrix)
-            res_explain.append(original_feat_explain)
-
-            if batch_nb == 0:
-                res_masks = masks
-            else:
+        with torch.inference_mode():
+            for batch_nb, data in enumerate(dataloader):
+                data = data.to(self.device, non_blocking=True)
+                if data.dtype != torch.float32:
+                    data = data.float()
+                with self._autocast_context():
+                    M_explain, masks = self.network.forward_masks(data)
                 for key, value in masks.items():
-                    res_masks[key] = np.vstack([res_masks[key], value])
+                    masks[key] = csc_matrix.dot(
+                        value.cpu().detach().numpy(), self.reducing_matrix
+                    )
+                original_feat_explain = csc_matrix.dot(
+                    M_explain.cpu().detach().numpy(), self.reducing_matrix
+                )
+                res_explain.append(original_feat_explain)
+
+                if batch_nb == 0:
+                    res_masks = masks
+                else:
+                    for key, value in masks.items():
+                        res_masks[key] = np.vstack([res_masks[key], value])
 
         res_explain = np.vstack(res_explain)
 
@@ -515,26 +561,36 @@ class TabModel(BaseEstimator):
         """
         batch_logs = {"batch_size": X.shape[0]}
 
-        X = X.to(self.device).float()
-        y = y.to(self.device).float()
+        X = X.to(self.device, non_blocking=True)
+        y = y.to(self.device, non_blocking=True)
+        if X.dtype != torch.float32:
+            X = X.float()
+        if y.dtype != torch.float32:
+            y = y.float()
 
         if self.augmentations is not None:
             X, y = self.augmentations(X, y)
 
-        for param in self.network.parameters():
-            param.grad = None
+        self._optimizer.zero_grad(set_to_none=True)
 
-        output, M_loss = self.network(X)
+        with self._autocast_context():
+            output, M_loss = self.network(X)
+            loss = self.compute_loss(output, y)
+            # Add the overall sparsity loss
+            loss = loss - self.lambda_sparse * M_loss
 
-        loss = self.compute_loss(output, y)
-        # Add the overall sparsity loss
-        loss = loss - self.lambda_sparse * M_loss
-
-        # Perform backward pass and optimization
-        loss.backward()
-        if self.clip_value:
-            clip_grad_norm_(self.network.parameters(), self.clip_value)
-        self._optimizer.step()
+        if self._grad_scaler.is_enabled():
+            self._grad_scaler.scale(loss).backward()
+            if self.clip_value:
+                self._grad_scaler.unscale_(self._optimizer)
+                clip_grad_norm_(self.network.parameters(), self.clip_value)
+            self._grad_scaler.step(self._optimizer)
+            self._grad_scaler.update()
+        else:
+            loss.backward()
+            if self.clip_value:
+                clip_grad_norm_(self.network.parameters(), self.clip_value)
+            self._optimizer.step()
 
         batch_logs["loss"] = loss.cpu().detach().numpy().item()
 
@@ -560,7 +616,7 @@ class TabModel(BaseEstimator):
         # Main loop
         for batch_idx, (X, y) in enumerate(loader):
             scores = self._predict_batch(X)
-            list_y_true.append(y)
+            list_y_true.append(to_numpy(y))
             list_y_score.append(scores)
 
         y_true, scores = self.stack_batches(list_y_true, list_y_score)
@@ -584,10 +640,14 @@ class TabModel(BaseEstimator):
         np.array
             model scores
         """
-        X = X.to(self.device).float()
+        X = X.to(self.device, non_blocking=True)
+        if X.dtype != torch.float32:
+            X = X.float()
 
         # compute model output
-        scores, _ = self.network(X)
+        with torch.inference_mode():
+            with self._autocast_context():
+                scores, _ = self.network(X)
 
         if isinstance(scores, list):
             scores = [x.cpu().detach().numpy() for x in scores]
@@ -744,6 +804,7 @@ class TabModel(BaseEstimator):
             self.num_workers,
             self.drop_last,
             self.pin_memory,
+            device=self.device,
         )
         return train_dataloader, valid_dataloaders
 

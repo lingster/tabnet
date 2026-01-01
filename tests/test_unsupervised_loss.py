@@ -20,6 +20,9 @@ from pytorch_tabnet.metrics import UnsupervisedLoss, UnsupervisedLossNumpy
     ]
 )
 def test_equal_losses(y_pred, embedded_x, obf_vars):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for GPU-only tests.")
+    device = torch.device("cuda")
     numpy_loss = UnsupervisedLossNumpy(
         y_pred=y_pred,
         embedded_x=embedded_x,
@@ -27,9 +30,9 @@ def test_equal_losses(y_pred, embedded_x, obf_vars):
     )
 
     torch_loss = UnsupervisedLoss(
-        y_pred=torch.tensor(y_pred, dtype=torch.float64),
-        embedded_x=torch.tensor(embedded_x, dtype=torch.float64),
-        obf_vars=torch.tensor(obf_vars, dtype=torch.float64)
+        y_pred=torch.tensor(y_pred, dtype=torch.float64, device=device),
+        embedded_x=torch.tensor(embedded_x, dtype=torch.float64, device=device),
+        obf_vars=torch.tensor(obf_vars, dtype=torch.float64, device=device)
     )
 
-    assert np.isclose(numpy_loss, torch_loss.detach().numpy())
+    assert np.isclose(numpy_loss, torch_loss.detach().cpu().numpy(), rtol=1e-5, atol=1e-7)

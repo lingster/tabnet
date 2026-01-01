@@ -163,7 +163,7 @@ class TabNetEncoder(torch.nn.Module):
 
         bs = x.shape[0]  # batch size
         if prior is None:
-            prior = torch.ones((bs, self.attention_dim)).to(x.device)
+            prior = torch.ones((bs, self.attention_dim), device=x.device, dtype=x.dtype)
 
         M_loss = 0
         att = self.initial_splitter(x)[:, self.n_d :]
@@ -190,8 +190,8 @@ class TabNetEncoder(torch.nn.Module):
     def forward_masks(self, x):
         x = self.initial_bn(x)
         bs = x.shape[0]  # batch size
-        prior = torch.ones((bs, self.attention_dim)).to(x.device)
-        M_explain = torch.zeros(x.shape).to(x.device)
+        prior = torch.ones((bs, self.attention_dim), device=x.device, dtype=x.dtype)
+        M_explain = torch.zeros_like(x)
         att = self.initial_splitter(x)[:, self.n_d :]
         masks = {}
 
@@ -389,7 +389,7 @@ class TabNetPretraining(torch.nn.Module):
         else:
             steps_out, _ = self.encoder(embedded_x)
             res = self.decoder(steps_out)
-            return res, embedded_x, torch.ones(embedded_x.shape).to(x.device)
+            return res, embedded_x, torch.ones(embedded_x.shape, device=x.device, dtype=x.dtype)
 
     def forward_masks(self, x):
         embedded_x = self.embedder(x)
@@ -769,7 +769,7 @@ class GLU_Block(torch.nn.Module):
             self.glu_layers.append(GLU_Layer(output_dim, output_dim, fc=fc, **params))
 
     def forward(self, x):
-        scale = torch.sqrt(torch.FloatTensor([0.5]).to(x.device))
+        scale = x.new_tensor(0.5).sqrt()
         if self.first:  # the first layer of the block has no scale multiplication
             x = self.glu_layers[0](x)
             layers_left = range(1, self.n_glu)
@@ -884,7 +884,7 @@ class EmbeddingGenerator(torch.nn.Module):
         for feat_init_idx, is_continuous in enumerate(self.continuous_idx):
             # Enumerate through continuous idx boolean mask to apply embeddings
             if is_continuous:
-                cols.append(x[:, feat_init_idx].float().view(-1, 1))
+                cols.append(x[:, feat_init_idx].to(dtype=x.dtype).view(-1, 1))
             else:
                 cols.append(
                     self.embeddings[cat_feat_counter](x[:, feat_init_idx].long())
@@ -927,7 +927,8 @@ class RandomObfuscator(torch.nn.Module):
         bs = x.shape[0]
 
         obfuscated_groups = torch.bernoulli(
-            self.pretraining_ratio * torch.ones((bs, self.num_groups), device=x.device)
+            self.pretraining_ratio
+            * torch.ones((bs, self.num_groups), device=x.device, dtype=x.dtype)
         )
         obfuscated_vars = torch.matmul(obfuscated_groups, self.group_matrix)
         masked_input = torch.mul(1 - obfuscated_vars, x)

@@ -1,6 +1,5 @@
 import torch
 from pytorch_tabnet.utils import define_device
-import numpy as np
 
 
 class RegressionSMOTE():
@@ -24,7 +23,6 @@ class RegressionSMOTE():
 
     def _set_seed(self):
         torch.manual_seed(self.seed)
-        np.random.seed(self.seed)
         return
 
     def __call__(self, X, y):
@@ -33,8 +31,9 @@ class RegressionSMOTE():
         idx_to_change = random_values < self.p
 
         # ensure that first element to switch has probability > 0.5
-        np_betas = np.random.beta(self.alpha, self.beta, batch_size) / 2 + 0.5
-        random_betas = torch.from_numpy(np_betas).to(self.device).float()
+        beta_dist = torch.distributions.Beta(self.alpha, self.beta)
+        random_betas = beta_dist.sample((batch_size,)).to(self.device)
+        random_betas = random_betas / 2 + 0.5
         index_permute = torch.randperm(batch_size, device=self.device)
 
         X[idx_to_change] = random_betas[idx_to_change, None] * X[idx_to_change]
@@ -66,7 +65,6 @@ class ClassificationSMOTE():
 
     def _set_seed(self):
         torch.manual_seed(self.seed)
-        np.random.seed(self.seed)
         return
 
     def __call__(self, X, y):
@@ -75,8 +73,9 @@ class ClassificationSMOTE():
         idx_to_change = random_values < self.p
 
         # ensure that first element to switch has probability > 0.5
-        np_betas = np.random.beta(self.alpha, self.beta, batch_size) / 2 + 0.5
-        random_betas = torch.from_numpy(np_betas).to(self.device).float()
+        beta_dist = torch.distributions.Beta(self.alpha, self.beta)
+        random_betas = beta_dist.sample((batch_size,)).to(self.device)
+        random_betas = random_betas / 2 + 0.5
         index_permute = torch.randperm(batch_size, device=self.device)
 
         X[idx_to_change] = random_betas[idx_to_change, None] * X[idx_to_change]

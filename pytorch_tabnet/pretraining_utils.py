@@ -1,15 +1,27 @@
 from torch.utils.data import DataLoader
+import torch
+import numpy as np
+import warnings
 from pytorch_tabnet.utils import (
     create_sampler,
     SparsePredictDataset,
     PredictDataset,
-    check_input
+    check_input,
+    to_torch_tensor,
+    _should_use_torch_tensor,
 )
 import scipy
 
 
 def create_dataloaders(
-    X_train, eval_set, weights, batch_size, num_workers, drop_last, pin_memory
+    X_train,
+    eval_set,
+    weights,
+    batch_size,
+    num_workers,
+    drop_last,
+    pin_memory,
+    device=None,
 ):
     """
     Create dataloaders with or without subsampling depending on weights and balanced.
@@ -45,6 +57,13 @@ def create_dataloaders(
     """
     need_shuffle, sampler = create_sampler(weights, X_train)
 
+    use_torch_tensor = _should_use_torch_tensor(X_train, device) and not scipy.sparse.issparse(X_train)
+    if use_torch_tensor and device is not None and device.type == "cuda":
+        if num_workers != 0:
+            warnings.warn("num_workers > 0 with CUDA tensors is not supported; setting num_workers=0.")
+            num_workers = 0
+        pin_memory = False
+
     if scipy.sparse.issparse(X_train):
         train_dataloader = DataLoader(
             SparsePredictDataset(X_train),
@@ -55,9 +74,20 @@ def create_dataloaders(
             drop_last=drop_last,
             pin_memory=pin_memory,
         )
+    elif use_torch_tensor:
+        X_train_tensor = to_torch_tensor(X_train, device=device, dtype=torch.float32)
+        train_dataloader = DataLoader(
+            PredictDataset(X_train_tensor),
+            batch_size=batch_size,
+            sampler=sampler,
+            shuffle=need_shuffle,
+            num_workers=num_workers,
+            drop_last=drop_last,
+            pin_memory=pin_memory,
+        )
     else:
         train_dataloader = DataLoader(
-            PredictDataset(X_train),
+            PredictDataset(X_train.astype(np.float32)),
             batch_size=batch_size,
             sampler=sampler,
             shuffle=need_shuffle,
@@ -68,6 +98,12 @@ def create_dataloaders(
 
     valid_dataloaders = []
     for X in eval_set:
+        eval_use_torch = _should_use_torch_tensor(X, device) and not scipy.sparse.issparse(X)
+        if eval_use_torch and device is not None and device.type == "cuda":
+            if num_workers != 0:
+                warnings.warn("num_workers > 0 with CUDA tensors is not supported; setting num_workers=0.")
+                num_workers = 0
+            pin_memory = False
         if scipy.sparse.issparse(X):
             valid_dataloaders.append(
                 DataLoader(
@@ -80,10 +116,23 @@ def create_dataloaders(
                     pin_memory=pin_memory,
                 )
             )
+        elif eval_use_torch:
+            X_eval_tensor = to_torch_tensor(X, device=device, dtype=torch.float32)
+            valid_dataloaders.append(
+                DataLoader(
+                    PredictDataset(X_eval_tensor),
+                    batch_size=batch_size,
+                    sampler=sampler,
+                    shuffle=need_shuffle,
+                    num_workers=num_workers,
+                    drop_last=drop_last,
+                    pin_memory=pin_memory,
+                )
+            )
         else:
             valid_dataloaders.append(
                 DataLoader(
-                    PredictDataset(X),
+                    PredictDataset(X.astype(np.float32)),
                     batch_size=batch_size,
                     sampler=sampler,
                     shuffle=need_shuffle,

@@ -1,11 +1,9 @@
 import torch
 import numpy as np
 from scipy.special import softmax
-from pytorch_tabnet.utils import SparsePredictDataset, PredictDataset, filter_weights
+from pytorch_tabnet.utils import create_predict_dataloader, filter_weights
 from pytorch_tabnet.abstract_model import TabModel
 from pytorch_tabnet.multiclass_utils import infer_output_dim, check_output_dim
-from torch.utils.data import DataLoader
-import scipy
 
 
 class TabNetClassifier(TabModel):
@@ -90,26 +88,24 @@ class TabNetClassifier(TabModel):
         """
         self.network.eval()
 
-        if scipy.sparse.issparse(X):
-            dataloader = DataLoader(
-                SparsePredictDataset(X),
-                batch_size=self.batch_size,
-                shuffle=False,
-            )
-        else:
-            dataloader = DataLoader(
-                PredictDataset(X),
-                batch_size=self.batch_size,
-                shuffle=False,
-            )
+        dataloader = create_predict_dataloader(
+            X,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            device=self.device,
+        )
 
         results = []
-        for batch_nb, data in enumerate(dataloader):
-            data = data.to(self.device).float()
-
-            output, M_loss = self.network(data)
-            predictions = torch.nn.Softmax(dim=1)(output).cpu().detach().numpy()
-            results.append(predictions)
+        with torch.inference_mode():
+            for batch_nb, data in enumerate(dataloader):
+                data = data.to(self.device, non_blocking=True)
+                if data.dtype != torch.float32:
+                    data = data.float()
+                with self._autocast_context():
+                    output, _ = self.network(data)
+                predictions = torch.nn.Softmax(dim=1)(output).cpu().detach().numpy()
+                results.append(predictions)
         res = np.vstack(results)
         return res
 

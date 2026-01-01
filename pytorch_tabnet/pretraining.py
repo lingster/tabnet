@@ -1,12 +1,10 @@
 import torch
 import numpy as np
-from torch.utils.data import DataLoader
 from pytorch_tabnet import tab_network
 from pytorch_tabnet.utils import (
     create_explain_matrix,
     filter_weights,
-    SparsePredictDataset,
-    PredictDataset,
+    create_predict_dataloader,
     check_input,
     create_group_matrix,
 )
@@ -21,7 +19,6 @@ from pytorch_tabnet.metrics import (
     UnsupervisedLoss,
 )
 from pytorch_tabnet.abstract_model import TabModel
-import scipy
 
 
 class TabNetPretrainer(TabModel):
@@ -268,6 +265,7 @@ class TabNetPretrainer(TabModel):
             self.num_workers,
             self.drop_last,
             self.pin_memory,
+            device=self.device,
         )
         return train_dataloader, valid_dataloaders
 
@@ -312,19 +310,28 @@ class TabNetPretrainer(TabModel):
         """
         batch_logs = {"batch_size": X.shape[0]}
 
-        X = X.to(self.device).float()
+        X = X.to(self.device, non_blocking=True)
+        if X.dtype != torch.float32:
+            X = X.float()
 
-        for param in self.network.parameters():
-            param.grad = None
+        self._optimizer.zero_grad(set_to_none=True)
 
-        output, embedded_x, obf_vars = self.network(X)
-        loss = self.compute_loss(output, embedded_x, obf_vars)
+        with self._autocast_context():
+            output, embedded_x, obf_vars = self.network(X)
+            loss = self.compute_loss(output, embedded_x, obf_vars)
 
-        # Perform backward pass and optimization
-        loss.backward()
-        if self.clip_value:
-            clip_grad_norm_(self.network.parameters(), self.clip_value)
-        self._optimizer.step()
+        if self._grad_scaler.is_enabled():
+            self._grad_scaler.scale(loss).backward()
+            if self.clip_value:
+                self._grad_scaler.unscale_(self._optimizer)
+                clip_grad_norm_(self.network.parameters(), self.clip_value)
+            self._grad_scaler.step(self._optimizer)
+            self._grad_scaler.update()
+        else:
+            loss.backward()
+            if self.clip_value:
+                clip_grad_norm_(self.network.parameters(), self.clip_value)
+            self._optimizer.step()
 
         batch_logs["loss"] = loss.cpu().detach().numpy().item()
 
@@ -377,8 +384,12 @@ class TabNetPretrainer(TabModel):
         np.array
             model scores
         """
-        X = X.to(self.device).float()
-        return self.network(X)
+        X = X.to(self.device, non_blocking=True)
+        if X.dtype != torch.float32:
+            X = X.float()
+        with torch.inference_mode():
+            with self._autocast_context():
+                return self.network(X)
 
     def stack_batches(self, list_output, list_embedded_x, list_obfuscation):
         output = np.vstack(list_output)
@@ -402,27 +413,26 @@ class TabNetPretrainer(TabModel):
         """
         self.network.eval()
 
-        if scipy.sparse.issparse(X):
-            dataloader = DataLoader(
-                SparsePredictDataset(X),
-                batch_size=self.batch_size,
-                shuffle=False,
-            )
-        else:
-            dataloader = DataLoader(
-                PredictDataset(X),
-                batch_size=self.batch_size,
-                shuffle=False,
-            )
+        dataloader = create_predict_dataloader(
+            X,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            device=self.device,
+        )
 
         results = []
         embedded_res = []
-        for batch_nb, data in enumerate(dataloader):
-            data = data.to(self.device).float()
-            output, embeded_x, _ = self.network(data)
-            predictions = output.cpu().detach().numpy()
-            results.append(predictions)
-            embedded_res.append(embeded_x.cpu().detach().numpy())
+        with torch.inference_mode():
+            for batch_nb, data in enumerate(dataloader):
+                data = data.to(self.device, non_blocking=True)
+                if data.dtype != torch.float32:
+                    data = data.float()
+                with self._autocast_context():
+                    output, embeded_x, _ = self.network(data)
+                predictions = output.cpu().detach().numpy()
+                results.append(predictions)
+                embedded_res.append(embeded_x.cpu().detach().numpy())
         res_output = np.vstack(results)
         embedded_inputs = np.vstack(embedded_res)
         return res_output, embedded_inputs

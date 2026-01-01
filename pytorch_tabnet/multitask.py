@@ -1,11 +1,9 @@
 import torch
 import numpy as np
 from scipy.special import softmax
-from pytorch_tabnet.utils import SparsePredictDataset, PredictDataset, filter_weights
+from pytorch_tabnet.utils import create_predict_dataloader, filter_weights
 from pytorch_tabnet.abstract_model import TabModel
 from pytorch_tabnet.multiclass_utils import infer_multitask_output, check_output_dim
-from torch.utils.data import DataLoader
-import scipy
 
 
 class TabNetMultiTaskClassifier(TabModel):
@@ -98,31 +96,30 @@ class TabNetMultiTaskClassifier(TabModel):
         """
         self.network.eval()
 
-        if scipy.sparse.issparse(X):
-            dataloader = DataLoader(
-                SparsePredictDataset(X),
-                batch_size=self.batch_size,
-                shuffle=False,
-            )
-        else:
-            dataloader = DataLoader(
-                PredictDataset(X),
-                batch_size=self.batch_size,
-                shuffle=False,
-            )
+        dataloader = create_predict_dataloader(
+            X,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            device=self.device,
+        )
 
         results = {}
-        for data in dataloader:
-            data = data.to(self.device).float()
-            output, _ = self.network(data)
-            predictions = [
-                torch.argmax(torch.nn.Softmax(dim=1)(task_output), dim=1)
-                .cpu()
-                .detach()
-                .numpy()
-                .reshape(-1)
-                for task_output in output
-            ]
+        with torch.inference_mode():
+            for data in dataloader:
+                data = data.to(self.device, non_blocking=True)
+                if data.dtype != torch.float32:
+                    data = data.float()
+                with self._autocast_context():
+                    output, _ = self.network(data)
+                predictions = [
+                    torch.argmax(torch.nn.Softmax(dim=1)(task_output), dim=1)
+                    .cpu()
+                    .detach()
+                    .numpy()
+                    .reshape(-1)
+                    for task_output in output
+                ]
 
             for task_idx in range(len(self.output_dim)):
                 results[task_idx] = results.get(task_idx, []) + [predictions[task_idx]]
@@ -151,28 +148,27 @@ class TabNetMultiTaskClassifier(TabModel):
         """
         self.network.eval()
 
-        if scipy.sparse.issparse(X):
-            dataloader = DataLoader(
-                SparsePredictDataset(X),
-                batch_size=self.batch_size,
-                shuffle=False,
-            )
-        else:
-            dataloader = DataLoader(
-                PredictDataset(X),
-                batch_size=self.batch_size,
-                shuffle=False,
-            )
+        dataloader = create_predict_dataloader(
+            X,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            device=self.device,
+        )
 
         results = {}
-        for data in dataloader:
-            data = data.to(self.device).float()
-            output, _ = self.network(data)
-            predictions = [
-                torch.nn.Softmax(dim=1)(task_output).cpu().detach().numpy()
-                for task_output in output
-            ]
-            for task_idx in range(len(self.output_dim)):
-                results[task_idx] = results.get(task_idx, []) + [predictions[task_idx]]
+        with torch.inference_mode():
+            for data in dataloader:
+                data = data.to(self.device, non_blocking=True)
+                if data.dtype != torch.float32:
+                    data = data.float()
+                with self._autocast_context():
+                    output, _ = self.network(data)
+                predictions = [
+                    torch.nn.Softmax(dim=1)(task_output).cpu().detach().numpy()
+                    for task_output in output
+                ]
+                for task_idx in range(len(self.output_dim)):
+                    results[task_idx] = results.get(task_idx, []) + [predictions[task_idx]]
         res = [np.vstack(task_res) for task_res in results.values()]
         return res

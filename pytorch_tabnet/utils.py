@@ -8,6 +8,85 @@ from sklearn.utils import check_array
 import pandas as pd
 import warnings
 
+try:
+    import cudf
+except Exception:  # pragma: no cover - optional dependency
+    cudf = None
+
+try:
+    import cupy as cp
+except Exception:  # pragma: no cover - optional dependency
+    cp = None
+
+
+def _is_cudf_obj(x):
+    if cudf is None:
+        return False
+    return isinstance(x, (cudf.DataFrame, cudf.Series))
+
+
+def _is_cupy_array(x):
+    if cp is None:
+        return False
+    return isinstance(x, cp.ndarray)
+
+
+def to_numpy(x):
+    if isinstance(x, np.ndarray):
+        return x
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    if _is_cudf_obj(x):
+        return x.to_numpy()
+    if _is_cupy_array(x):
+        return cp.asnumpy(x)
+    return np.asarray(x)
+
+
+def _cupy_to_torch(x, device, dtype=None):
+    if device is None or device.type == "cpu":
+        tensor = torch.as_tensor(cp.asnumpy(x))
+        return tensor.to(dtype=dtype) if dtype is not None else tensor
+    if not x.flags.c_contiguous:
+        x = cp.ascontiguousarray(x)
+    tensor = torch.utils.dlpack.from_dlpack(x.toDlpack())
+    if dtype is not None:
+        tensor = tensor.to(dtype=dtype)
+    if tensor.device != device:
+        tensor = tensor.to(device)
+    return tensor
+
+
+def to_torch_tensor(x, device=None, dtype=None):
+    if torch.is_tensor(x):
+        return x.to(device=device, dtype=dtype) if device is not None else (
+            x.to(dtype=dtype) if dtype is not None else x
+        )
+    if _is_cudf_obj(x):
+        cupy_arr = x.to_cupy()
+        return _cupy_to_torch(cupy_arr, device=device, dtype=dtype)
+    if _is_cupy_array(x):
+        return _cupy_to_torch(x, device=device, dtype=dtype)
+    if isinstance(x, (pd.DataFrame, pd.Series)):
+        if cudf is None:
+            raise TypeError("Pandas input requires cudf to move data to GPU.")
+        return to_torch_tensor(cudf.from_pandas(x), device=device, dtype=dtype)
+    tensor = torch.as_tensor(x)
+    if dtype is not None:
+        tensor = tensor.to(dtype=dtype)
+    if device is not None:
+        tensor = tensor.to(device)
+    return tensor
+
+
+def _should_use_torch_tensor(x, device):
+    return (
+        torch.is_tensor(x)
+        or _is_cudf_obj(x)
+        or _is_cupy_array(x)
+        or (device is not None and device.type == "cuda")
+    )
+
 
 class TorchDataset(Dataset):
     """
@@ -121,13 +200,14 @@ def create_sampler(weights, y_train):
             sampler = None
         elif weights == 1:
             need_shuffle = False
+            y_train_np = to_numpy(y_train)
             class_sample_count = np.array(
-                [len(np.where(y_train == t)[0]) for t in np.unique(y_train)]
+                [len(np.where(y_train_np == t)[0]) for t in np.unique(y_train_np)]
             )
 
             weights = 1.0 / class_sample_count
 
-            samples_weight = np.array([weights[t] for t in y_train])
+            samples_weight = np.array([weights[t] for t in y_train_np])
 
             samples_weight = torch.from_numpy(samples_weight)
             samples_weight = samples_weight.double()
@@ -137,7 +217,8 @@ def create_sampler(weights, y_train):
     elif isinstance(weights, dict):
         # custom weights per class
         need_shuffle = False
-        samples_weight = np.array([weights[t] for t in y_train])
+        y_train_np = to_numpy(y_train)
+        samples_weight = np.array([weights[t] for t in y_train_np])
         sampler = WeightedRandomSampler(samples_weight, len(samples_weight))
     else:
         # custom weights
@@ -150,7 +231,15 @@ def create_sampler(weights, y_train):
 
 
 def create_dataloaders(
-    X_train, y_train, eval_set, weights, batch_size, num_workers, drop_last, pin_memory
+    X_train,
+    y_train,
+    eval_set,
+    weights,
+    batch_size,
+    num_workers,
+    drop_last,
+    pin_memory,
+    device=None,
 ):
     """
     Create dataloaders with or without subsampling depending on weights and balanced.
@@ -188,9 +277,28 @@ def create_dataloaders(
     """
     need_shuffle, sampler = create_sampler(weights, y_train)
 
+    use_torch_tensor = _should_use_torch_tensor(X_train, device) and not scipy.sparse.issparse(X_train)
+    if use_torch_tensor and device is not None and device.type == "cuda":
+        if num_workers != 0:
+            warnings.warn("num_workers > 0 with CUDA tensors is not supported; setting num_workers=0.")
+            num_workers = 0
+        pin_memory = False
+
     if scipy.sparse.issparse(X_train):
         train_dataloader = DataLoader(
             SparseTorchDataset(X_train.astype(np.float32), y_train),
+            batch_size=batch_size,
+            sampler=sampler,
+            shuffle=need_shuffle,
+            num_workers=num_workers,
+            drop_last=drop_last,
+            pin_memory=pin_memory,
+        )
+    elif use_torch_tensor:
+        X_train_tensor = to_torch_tensor(X_train, device=device, dtype=torch.float32)
+        y_train_tensor = to_torch_tensor(y_train, device=device, dtype=torch.float32)
+        train_dataloader = DataLoader(
+            TorchDataset(X_train_tensor, y_train_tensor),
             batch_size=batch_size,
             sampler=sampler,
             shuffle=need_shuffle,
@@ -211,10 +319,28 @@ def create_dataloaders(
 
     valid_dataloaders = []
     for X, y in eval_set:
+        eval_use_torch = _should_use_torch_tensor(X, device) and not scipy.sparse.issparse(X)
+        if eval_use_torch and device is not None and device.type == "cuda":
+            if num_workers != 0:
+                warnings.warn("num_workers > 0 with CUDA tensors is not supported; setting num_workers=0.")
+                num_workers = 0
+            pin_memory = False
         if scipy.sparse.issparse(X):
             valid_dataloaders.append(
                 DataLoader(
                     SparseTorchDataset(X.astype(np.float32), y),
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    pin_memory=pin_memory,
+                )
+            )
+        elif eval_use_torch:
+            X_eval_tensor = to_torch_tensor(X, device=device, dtype=torch.float32)
+            y_eval_tensor = to_torch_tensor(y, device=device, dtype=torch.float32)
+            valid_dataloaders.append(
+                DataLoader(
+                    TorchDataset(X_eval_tensor, y_eval_tensor),
                     batch_size=batch_size,
                     shuffle=False,
                     num_workers=num_workers,
@@ -233,6 +359,38 @@ def create_dataloaders(
             )
 
     return train_dataloader, valid_dataloaders
+
+
+def create_predict_dataloader(X, batch_size, num_workers, pin_memory, device=None):
+    use_torch_tensor = _should_use_torch_tensor(X, device) and not scipy.sparse.issparse(X)
+    if use_torch_tensor and device is not None and device.type == "cuda":
+        if num_workers != 0:
+            warnings.warn("num_workers > 0 with CUDA tensors is not supported; setting num_workers=0.")
+            num_workers = 0
+        pin_memory = False
+
+    if scipy.sparse.issparse(X):
+        return DataLoader(
+            SparsePredictDataset(X),
+            batch_size=batch_size,
+            shuffle=False,
+        )
+    if use_torch_tensor:
+        X_tensor = to_torch_tensor(X, device=device, dtype=torch.float32)
+        return DataLoader(
+            PredictDataset(X_tensor),
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+    return DataLoader(
+        PredictDataset(X.astype(np.float32)),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
 
 
 def create_explain_matrix(input_dim, cat_emb_dim, cat_idxs, post_embed_dim):
@@ -462,7 +620,7 @@ def validate_eval_set(eval_set, eval_name, X_train, y_train):
     return eval_name, eval_set
 
 
-def define_device(device_name):
+def define_device(device_name, require_cuda=False):
     """
     Define the device to use during training and inference.
     If auto it will detect automatically whether to use cuda or cpu
@@ -480,12 +638,14 @@ def define_device(device_name):
     if device_name == "auto":
         if torch.cuda.is_available():
             return "cuda"
-        else:
-            return "cpu"
-    elif device_name == "cuda" and not torch.cuda.is_available():
+        if require_cuda:
+            raise RuntimeError("CUDA is required but not available.")
         return "cpu"
-    else:
-        return device_name
+    if str(device_name).startswith("cuda") and not torch.cuda.is_available():
+        if require_cuda:
+            raise RuntimeError("CUDA is required but not available.")
+        return "cpu"
+    return device_name
 
 
 class ComplexEncoder(json.JSONEncoder):
@@ -501,8 +661,12 @@ def check_input(X):
     Raise a clear error if X is a pandas dataframe
     and check array according to scikit rules
     """
+    if _is_cudf_obj(X) or _is_cupy_array(X) or torch.is_tensor(X):
+        if hasattr(X, "ndim") and X.ndim < 2:
+            raise ValueError("X should be 2D (n_samples, n_features).")
+        return
     if isinstance(X, (pd.DataFrame, pd.Series)):
-        err_message = "Pandas DataFrame are not supported: apply X.values when calling fit"
+        err_message = "Pandas DataFrame are not supported: use cudf.DataFrame or numpy arrays."
         raise TypeError(err_message)
     check_array(X, accept_sparse=True)
 
