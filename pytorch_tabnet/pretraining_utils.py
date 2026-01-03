@@ -9,8 +9,14 @@ from pytorch_tabnet.utils import (
     check_input,
     to_torch_tensor,
     _should_use_torch_tensor,
+    CUPY_AVAILABLE,
 )
 import scipy
+
+try:
+    import cupy as cp
+except Exception:
+    cp = None
 
 
 def create_dataloaders(

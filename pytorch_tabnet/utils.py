@@ -15,8 +15,76 @@ except Exception:  # pragma: no cover - optional dependency
 
 try:
     import cupy as cp
+    CUPY_AVAILABLE = True
 except Exception:  # pragma: no cover - optional dependency
     cp = None
+    CUPY_AVAILABLE = False
+
+
+def get_xp(prefer_gpu=True):
+    """Get the array module to use (cupy if available and preferred, else numpy).
+
+    Parameters
+    ----------
+    prefer_gpu : bool
+        If True, return cupy when available. If False, always return numpy.
+
+    Returns
+    -------
+    module
+        Either cupy or numpy module.
+    """
+    if prefer_gpu and CUPY_AVAILABLE:
+        return cp
+    return np
+
+
+def to_gpu(x):
+    """Move array to GPU if cupy is available.
+
+    Parameters
+    ----------
+    x : array-like
+        Input array (numpy, cupy, or torch tensor).
+
+    Returns
+    -------
+    array
+        CuPy array if available, otherwise returns input unchanged.
+    """
+    if not CUPY_AVAILABLE:
+        return x
+    if isinstance(x, np.ndarray):
+        return cp.asarray(x)
+    if _is_cupy_array(x):
+        return x
+    if torch.is_tensor(x):
+        if x.device.type == 'cuda':
+            return cp.from_dlpack(x.detach())
+        return cp.asarray(x.detach().cpu().numpy())
+    return cp.asarray(x)
+
+
+def to_cpu(x):
+    """Move array to CPU (numpy).
+
+    Parameters
+    ----------
+    x : array-like
+        Input array (numpy, cupy, or torch tensor).
+
+    Returns
+    -------
+    np.ndarray
+        Numpy array on CPU.
+    """
+    if isinstance(x, np.ndarray):
+        return x
+    if _is_cupy_array(x):
+        return cp.asnumpy(x)
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
 
 
 def _is_cudf_obj(x):
@@ -35,7 +103,11 @@ def to_numpy(x):
     if isinstance(x, np.ndarray):
         return x
     if torch.is_tensor(x):
-        return x.detach().cpu().numpy()
+        tensor = x.detach().cpu()
+        # bfloat16 is not supported by numpy; convert to float32
+        if tensor.dtype == torch.bfloat16:
+            tensor = tensor.float()
+        return tensor.numpy()
     if _is_cudf_obj(x):
         return x.to_numpy()
     if _is_cupy_array(x):
@@ -49,7 +121,7 @@ def _cupy_to_torch(x, device, dtype=None):
         return tensor.to(dtype=dtype) if dtype is not None else tensor
     if not x.flags.c_contiguous:
         x = cp.ascontiguousarray(x)
-    tensor = torch.utils.dlpack.from_dlpack(x.toDlpack())
+    tensor = torch.from_dlpack(x)
     if dtype is not None:
         tensor = tensor.to(dtype=dtype)
     if tensor.device != device:
@@ -77,6 +149,21 @@ def to_torch_tensor(x, device=None, dtype=None):
     if device is not None:
         tensor = tensor.to(device)
     return tensor
+
+
+def _infer_tensor_dtype(x):
+    """Keep integer feature tensors on GPU to save memory."""
+    if _is_cudf_obj(x):
+        try:
+            dtypes = list(x.dtypes)
+        except Exception:
+            dtypes = []
+        if dtypes and all(str(dt).startswith(("uint", "int")) for dt in dtypes):
+            return None
+    if _is_cupy_array(x):
+        if str(x.dtype).startswith(("uint", "int")):
+            return None
+    return torch.float32
 
 
 def _should_use_torch_tensor(x, device):
@@ -194,6 +281,7 @@ def create_sampler(weights, y_train):
     y_train : np.array
         Training targets
     """
+    xp = get_xp()
     if isinstance(weights, int):
         if weights == 0:
             need_shuffle = True
@@ -201,6 +289,7 @@ def create_sampler(weights, y_train):
         elif weights == 1:
             need_shuffle = False
             y_train_np = to_numpy(y_train)
+            # Use numpy for class counting as it needs to work with sklearn
             class_sample_count = np.array(
                 [len(np.where(y_train_np == t)[0]) for t in np.unique(y_train_np)]
             )
@@ -225,7 +314,7 @@ def create_sampler(weights, y_train):
         if len(weights) != len(y_train):
             raise ValueError("Custom weights should match number of train samples.")
         need_shuffle = False
-        samples_weight = np.array(weights)
+        samples_weight = to_cpu(xp.asarray(weights))
         sampler = WeightedRandomSampler(samples_weight, len(samples_weight))
     return need_shuffle, sampler
 
@@ -295,7 +384,8 @@ def create_dataloaders(
             pin_memory=pin_memory,
         )
     elif use_torch_tensor:
-        X_train_tensor = to_torch_tensor(X_train, device=device, dtype=torch.float32)
+        x_dtype = _infer_tensor_dtype(X_train)
+        X_train_tensor = to_torch_tensor(X_train, device=device, dtype=x_dtype)
         y_train_tensor = to_torch_tensor(y_train, device=device, dtype=torch.float32)
         train_dataloader = DataLoader(
             TorchDataset(X_train_tensor, y_train_tensor),
@@ -336,7 +426,8 @@ def create_dataloaders(
                 )
             )
         elif eval_use_torch:
-            X_eval_tensor = to_torch_tensor(X, device=device, dtype=torch.float32)
+            x_dtype = _infer_tensor_dtype(X)
+            X_eval_tensor = to_torch_tensor(X, device=device, dtype=x_dtype)
             y_eval_tensor = to_torch_tensor(y, device=device, dtype=torch.float32)
             valid_dataloaders.append(
                 DataLoader(
@@ -376,7 +467,8 @@ def create_predict_dataloader(X, batch_size, num_workers, pin_memory, device=Non
             shuffle=False,
         )
     if use_torch_tensor:
-        X_tensor = to_torch_tensor(X, device=device, dtype=torch.float32)
+        x_dtype = _infer_tensor_dtype(X)
+        X_tensor = to_torch_tensor(X, device=device, dtype=x_dtype)
         return DataLoader(
             PredictDataset(X_tensor),
             batch_size=batch_size,
@@ -416,6 +508,7 @@ def create_explain_matrix(input_dim, cat_emb_dim, cat_idxs, post_embed_dim):
     reducing_matrix : np.array
         Matrix of dim (post_embed_dim, input_dim)  to performe reduce
     """
+    xp = get_xp()
 
     if isinstance(cat_emb_dim, int):
         all_emb_impact = [cat_emb_dim - 1] * len(cat_idxs)
@@ -435,10 +528,13 @@ def create_explain_matrix(input_dim, cat_emb_dim, cat_idxs, post_embed_dim):
             acc_emb += all_emb_impact[nb_emb]
             nb_emb += 1
 
-    reducing_matrix = np.zeros((post_embed_dim, input_dim))
+    reducing_matrix = xp.zeros((post_embed_dim, input_dim))
     for i, cols in enumerate(indices_trick):
         reducing_matrix[cols, i] = 1
 
+    # Use scipy sparse for CPU, or return dense for GPU
+    if CUPY_AVAILABLE and xp is cp:
+        return reducing_matrix  # Keep as cupy array for GPU operations
     return scipy.sparse.csc_matrix(reducing_matrix)
 
 
@@ -464,11 +560,12 @@ def create_group_matrix(list_groups, input_dim):
     """
     check_list_groups(list_groups, input_dim)
 
+    xp = get_xp()
     if len(list_groups) == 0:
         group_matrix = torch.eye(input_dim)
         return group_matrix
     else:
-        n_groups = input_dim - int(np.sum([len(gp) - 1 for gp in list_groups]))
+        n_groups = input_dim - int(xp.sum(xp.asarray([len(gp) - 1 for gp in list_groups])))
         group_matrix = torch.zeros((n_groups, input_dim))
 
         remaining_features = [feat_idx for feat_idx in range(input_dim)]
@@ -506,6 +603,7 @@ def check_list_groups(list_groups, input_dim):
     - input_dim : number of feature in the initial dataset
     """
     assert isinstance(list_groups, list), "list_groups must be a list of list."
+    xp = get_xp()
 
     if len(list_groups) == 0:
         return
@@ -515,16 +613,16 @@ def check_list_groups(list_groups, input_dim):
             assert isinstance(group, list), msg
             assert len(group) > 0, "Empty groups are forbidding please remove empty groups []"
 
-    n_elements_in_groups = np.sum([len(group) for group in list_groups])
+    n_elements_in_groups = int(xp.sum(xp.asarray([len(group) for group in list_groups])))
     flat_list = []
     for group in list_groups:
         flat_list.extend(group)
-    unique_elements = np.unique(flat_list)
+    unique_elements = xp.unique(xp.asarray(flat_list))
     n_unique_elements_in_groups = len(unique_elements)
     msg = f"One feature can only appear in one group, please check your grouped_features."
     assert n_unique_elements_in_groups == n_elements_in_groups, msg
 
-    highest_feat = np.max(unique_elements)
+    highest_feat = int(xp.max(unique_elements))
     assert highest_feat < input_dim, f"Number of features is {input_dim} but one group contains {highest_feat}."  # noqa
     return
 
@@ -652,6 +750,8 @@ class ComplexEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, (np.generic, np.ndarray)):
             return obj.tolist()
+        if CUPY_AVAILABLE and _is_cupy_array(obj):
+            return cp.asnumpy(obj).tolist()
         # Let the base class default method raise the TypeError
         return json.JSONEncoder.default(self, obj)
 
@@ -708,8 +808,11 @@ def check_embedding_parameters(cat_dims, cat_idxs, cat_emb_dim):
         raise ValueError(msg)
 
     # Rearrange to get reproducible seeds with different ordering
+    xp = get_xp()
     if len(cat_idxs) > 0:
-        sorted_idxs = np.argsort(cat_idxs)
+        sorted_idxs = xp.argsort(xp.asarray(cat_idxs))
+        if CUPY_AVAILABLE and xp is cp:
+            sorted_idxs = cp.asnumpy(sorted_idxs)
         cat_dims = [cat_dims[i] for i in sorted_idxs]
         cat_emb_dims = [cat_emb_dims[i] for i in sorted_idxs]
 

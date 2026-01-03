@@ -1,9 +1,20 @@
 import torch
 import numpy as np
 from scipy.special import softmax
-from pytorch_tabnet.utils import create_predict_dataloader, filter_weights
+from pytorch_tabnet.utils import (
+    create_predict_dataloader,
+    filter_weights,
+    get_xp,
+    to_cpu,
+    CUPY_AVAILABLE,
+)
 from pytorch_tabnet.abstract_model import TabModel
 from pytorch_tabnet.multiclass_utils import infer_output_dim, check_output_dim
+
+try:
+    import cupy as cp
+except Exception:
+    cp = None
 
 
 class TabNetClassifier(TabModel):
@@ -63,14 +74,24 @@ class TabNetClassifier(TabModel):
         self.updated_weights = self.weight_updater(weights)
 
     def stack_batches(self, list_y_true, list_y_score):
-        y_true = np.hstack(list_y_true)
-        y_score = np.vstack(list_y_score)
-        y_score = softmax(y_score, axis=1)
+        if torch.is_tensor(list_y_true[0]):
+            y_true = torch.cat(list_y_true, dim=0)
+            y_score = torch.cat(list_y_score, dim=0)
+            y_score = torch.softmax(y_score, dim=1)
+            return y_true, y_score
+        xp = get_xp()
+        y_true = xp.hstack(list_y_true)
+        y_score = xp.vstack(list_y_score)
+        # softmax requires CPU arrays
+        y_score = softmax(to_cpu(y_score), axis=1)
+        if CUPY_AVAILABLE:
+            y_score = xp.asarray(y_score)
         return y_true, y_score
 
     def predict_func(self, outputs):
-        outputs = np.argmax(outputs, axis=1)
-        return np.vectorize(self.preds_mapper.get)(outputs.astype(str))
+        xp = get_xp()
+        outputs = xp.argmax(outputs, axis=1)
+        return np.vectorize(self.preds_mapper.get)(to_cpu(outputs).astype(str))
 
     def predict_proba(self, X):
         """
@@ -96,6 +117,7 @@ class TabNetClassifier(TabModel):
             device=self.device,
         )
 
+        xp = get_xp()
         results = []
         with torch.inference_mode():
             for batch_nb, data in enumerate(dataloader):
@@ -104,9 +126,13 @@ class TabNetClassifier(TabModel):
                     data = data.float()
                 with self._autocast_context():
                     output, _ = self.network(data)
-                predictions = torch.nn.Softmax(dim=1)(output).cpu().detach().numpy()
+                softmax_output = torch.nn.Softmax(dim=1)(output)
+                if CUPY_AVAILABLE and self.device.type == 'cuda':
+                    predictions = cp.from_dlpack(softmax_output.detach())
+                else:
+                    predictions = softmax_output.cpu().detach().numpy()
                 results.append(predictions)
-        res = np.vstack(results)
+        res = xp.vstack(results)
         return res
 
 
@@ -145,6 +171,11 @@ class TabNetRegressor(TabModel):
         return outputs
 
     def stack_batches(self, list_y_true, list_y_score):
-        y_true = np.vstack(list_y_true)
-        y_score = np.vstack(list_y_score)
+        if torch.is_tensor(list_y_true[0]):
+            y_true = torch.cat(list_y_true, dim=0)
+            y_score = torch.cat(list_y_score, dim=0)
+            return y_true, y_score
+        xp = get_xp()
+        y_true = xp.vstack(list_y_true)
+        y_score = xp.vstack(list_y_score)
         return y_true, y_score

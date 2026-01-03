@@ -19,7 +19,15 @@ from pytorch_tabnet.utils import (
     create_group_matrix,
     check_embedding_parameters,
     to_numpy,
+    get_xp,
+    to_cpu,
+    CUPY_AVAILABLE,
 )
+
+try:
+    import cupy as cp
+except Exception:
+    cp = None
 from pytorch_tabnet.callbacks import (
     CallbackContainer,
     History,
@@ -86,7 +94,7 @@ class TabModel(BaseEstimator):
             define_device(self.device_name, require_cuda=self.require_cuda)
         )
         if self.verbose != 0:
-            warnings.warn(f"Device used : {self.device}")
+            print(f"Device used : {self.device}")
 
         self.pin_memory = self.device.type != "cpu"
         self._configure_torch_backend()
@@ -161,7 +169,7 @@ class TabModel(BaseEstimator):
         self.use_amp = bool(self.use_amp and self.device.type == "cuda")
         self._amp_dtype = self._resolve_amp_dtype()
         enable_scaler = self.use_amp and self._amp_dtype == torch.float16
-        self._grad_scaler = torch.cuda.amp.GradScaler(enabled=enable_scaler)
+        self._grad_scaler = torch.amp.GradScaler("cuda", enabled=enable_scaler)
 
     def _autocast_context(self):
         if self.use_amp and self.device.type == "cuda":
@@ -349,6 +357,7 @@ class TabModel(BaseEstimator):
             device=self.device,
         )
 
+        xp = get_xp()
         results = []
         with torch.inference_mode():
             for batch_nb, data in enumerate(dataloader):
@@ -357,9 +366,12 @@ class TabModel(BaseEstimator):
                     data = data.float()
                 with self._autocast_context():
                     output, _ = self.network(data)
-                predictions = output.cpu().detach().numpy()
+                if CUPY_AVAILABLE and self.device.type == 'cuda':
+                    predictions = cp.from_dlpack(output.detach())
+                else:
+                    predictions = output.cpu().detach().numpy()
                 results.append(predictions)
-        res = np.vstack(results)
+        res = xp.vstack(results)
         return self.predict_func(res)
 
     def explain(self, X, normalize=False):
@@ -401,10 +413,10 @@ class TabModel(BaseEstimator):
                     M_explain, masks = self.network.forward_masks(data)
                 for key, value in masks.items():
                     masks[key] = csc_matrix.dot(
-                        value.cpu().detach().numpy(), self.reducing_matrix
+                        to_numpy(value), self.reducing_matrix
                     )
                 original_feat_explain = csc_matrix.dot(
-                    M_explain.cpu().detach().numpy(), self.reducing_matrix
+                    to_numpy(M_explain), self.reducing_matrix
                 )
                 res_explain.append(original_feat_explain)
 
@@ -414,10 +426,11 @@ class TabModel(BaseEstimator):
                     for key, value in masks.items():
                         res_masks[key] = np.vstack([res_masks[key], value])
 
-        res_explain = np.vstack(res_explain)
+        xp = get_xp()
+        res_explain = xp.vstack(res_explain)
 
         if normalize:
-            res_explain /= np.sum(res_explain, axis=1)[:, None]
+            res_explain /= xp.sum(res_explain, axis=1)[:, None]
 
         return res_explain, res_masks
 
@@ -592,7 +605,8 @@ class TabModel(BaseEstimator):
                 clip_grad_norm_(self.network.parameters(), self.clip_value)
             self._optimizer.step()
 
-        batch_logs["loss"] = loss.cpu().detach().numpy().item()
+        # Keep loss on device to avoid per-batch CPU sync; History will sync once per epoch.
+        batch_logs["loss"] = loss.detach()
 
         return batch_logs
 
@@ -615,8 +629,12 @@ class TabModel(BaseEstimator):
 
         # Main loop
         for batch_idx, (X, y) in enumerate(loader):
-            scores = self._predict_batch(X)
-            list_y_true.append(to_numpy(y))
+            scores = self._predict_batch(X, return_numpy=False)
+            if torch.is_tensor(y):
+                y = y.to(self.device, non_blocking=True)
+            else:
+                y = torch.as_tensor(y, device=self.device)
+            list_y_true.append(y.detach())
             list_y_score.append(scores)
 
         y_true, scores = self.stack_batches(list_y_true, list_y_score)
@@ -626,7 +644,7 @@ class TabModel(BaseEstimator):
         self.history.epoch_metrics.update(metrics_logs)
         return
 
-    def _predict_batch(self, X):
+    def _predict_batch(self, X, return_numpy=False):
         """
         Predict one batch of data.
 
@@ -650,9 +668,21 @@ class TabModel(BaseEstimator):
                 scores, _ = self.network(X)
 
         if isinstance(scores, list):
-            scores = [x.cpu().detach().numpy() for x in scores]
+            cleaned = []
+            for x in scores:
+                if x.dtype == torch.bfloat16:
+                    x = x.float()
+                x = x.detach()
+                if return_numpy:
+                    x = x.cpu().numpy()
+                cleaned.append(x)
+            scores = cleaned
         else:
-            scores = scores.cpu().detach().numpy()
+            if scores.dtype == torch.bfloat16:
+                scores = scores.float()
+            scores = scores.detach()
+            if return_numpy:
+                scores = scores.cpu().numpy()
 
         return scores
 
@@ -817,9 +847,10 @@ class TabModel(BaseEstimator):
             Pytorch dataloader.
 
         """
+        xp = get_xp()
         M_explain, _ = self.explain(X, normalize=False)
         sum_explain = M_explain.sum(axis=0)
-        feature_importances_ = sum_explain / np.sum(sum_explain)
+        feature_importances_ = sum_explain / xp.sum(sum_explain)
         return feature_importances_
 
     def _update_network_params(self):

@@ -18,6 +18,13 @@ import scipy.sparse as sp
 import numpy as np
 import pandas as pd
 
+try:
+    import cupy as cp
+    CUPY_AVAILABLE = True
+except Exception:
+    cp = None
+    CUPY_AVAILABLE = False
+
 
 def _assert_all_finite(X, allow_nan=False):
     """Like assert_all_finite, but only for ndarray."""

@@ -1,9 +1,20 @@
 import torch
 import numpy as np
 from scipy.special import softmax
-from pytorch_tabnet.utils import create_predict_dataloader, filter_weights
+from pytorch_tabnet.utils import (
+    create_predict_dataloader,
+    filter_weights,
+    get_xp,
+    to_cpu,
+    CUPY_AVAILABLE,
+)
 from pytorch_tabnet.abstract_model import TabModel
 from pytorch_tabnet.multiclass_utils import infer_multitask_output, check_output_dim
+
+try:
+    import cupy as cp
+except Exception:
+    cp = None
 
 
 class TabNetMultiTaskClassifier(TabModel):
@@ -54,11 +65,15 @@ class TabNetMultiTaskClassifier(TabModel):
         return loss
 
     def stack_batches(self, list_y_true, list_y_score):
-        y_true = np.vstack(list_y_true)
+        xp = get_xp()
+        y_true = xp.vstack(list_y_true)
         y_score = []
         for i in range(len(self.output_dim)):
-            score = np.vstack([x[i] for x in list_y_score])
-            score = softmax(score, axis=1)
+            score = xp.vstack([x[i] for x in list_y_score])
+            # softmax requires CPU arrays
+            score = softmax(to_cpu(score), axis=1)
+            if CUPY_AVAILABLE:
+                score = xp.asarray(score)
             y_score.append(score)
         return y_true, y_score
 
@@ -104,6 +119,7 @@ class TabNetMultiTaskClassifier(TabModel):
             device=self.device,
         )
 
+        xp = get_xp()
         results = {}
         with torch.inference_mode():
             for data in dataloader:
@@ -112,22 +128,30 @@ class TabNetMultiTaskClassifier(TabModel):
                     data = data.float()
                 with self._autocast_context():
                     output, _ = self.network(data)
-                predictions = [
-                    torch.argmax(torch.nn.Softmax(dim=1)(task_output), dim=1)
-                    .cpu()
-                    .detach()
-                    .numpy()
-                    .reshape(-1)
-                    for task_output in output
-                ]
+                if CUPY_AVAILABLE and self.device.type == 'cuda':
+                    predictions = [
+                        cp.from_dlpack(
+                            torch.argmax(torch.nn.Softmax(dim=1)(task_output), dim=1).detach()
+                        ).reshape(-1)
+                        for task_output in output
+                    ]
+                else:
+                    predictions = [
+                        torch.argmax(torch.nn.Softmax(dim=1)(task_output), dim=1)
+                        .cpu()
+                        .detach()
+                        .numpy()
+                        .reshape(-1)
+                        for task_output in output
+                    ]
 
             for task_idx in range(len(self.output_dim)):
                 results[task_idx] = results.get(task_idx, []) + [predictions[task_idx]]
         # stack all task individually
-        results = [np.hstack(task_res) for task_res in results.values()]
-        # map all task individually
+        results = [xp.hstack(task_res) for task_res in results.values()]
+        # map all task individually (requires CPU arrays)
         results = [
-            np.vectorize(self.preds_mapper[task_idx].get)(task_res.astype(str))
+            np.vectorize(self.preds_mapper[task_idx].get)(to_cpu(task_res).astype(str))
             for task_idx, task_res in enumerate(results)
         ]
         return results
@@ -156,6 +180,7 @@ class TabNetMultiTaskClassifier(TabModel):
             device=self.device,
         )
 
+        xp = get_xp()
         results = {}
         with torch.inference_mode():
             for data in dataloader:
@@ -164,11 +189,17 @@ class TabNetMultiTaskClassifier(TabModel):
                     data = data.float()
                 with self._autocast_context():
                     output, _ = self.network(data)
-                predictions = [
-                    torch.nn.Softmax(dim=1)(task_output).cpu().detach().numpy()
-                    for task_output in output
-                ]
+                if CUPY_AVAILABLE and self.device.type == 'cuda':
+                    predictions = [
+                        cp.from_dlpack(torch.nn.Softmax(dim=1)(task_output).detach())
+                        for task_output in output
+                    ]
+                else:
+                    predictions = [
+                        torch.nn.Softmax(dim=1)(task_output).cpu().detach().numpy()
+                        for task_output in output
+                    ]
                 for task_idx in range(len(self.output_dim)):
                     results[task_idx] = results.get(task_idx, []) + [predictions[task_idx]]
-        res = [np.vstack(task_res) for task_res in results.values()]
+        res = [xp.vstack(task_res) for task_res in results.values()]
         return res

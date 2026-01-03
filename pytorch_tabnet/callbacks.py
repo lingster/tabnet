@@ -2,9 +2,17 @@ import time
 import datetime
 import copy
 import numpy as np
+import torch
 from dataclasses import dataclass, field
 from typing import List, Any
 import warnings
+
+try:
+    import cupy as cp
+    CUPY_AVAILABLE = True
+except Exception:
+    cp = None
+    CUPY_AVAILABLE = False
 
 
 class Callback:
@@ -205,10 +213,18 @@ class History(Callback):
     def on_epoch_begin(self, epoch, logs=None):
         self.epoch_metrics = {"loss": 0.0}
         self.samples_seen = 0.0
+        self.epoch_loss = None
 
     def on_epoch_end(self, epoch, logs=None):
-        self.epoch_metrics["loss"] = self.epoch_loss
+        epoch_loss = self.epoch_loss
+        if torch.is_tensor(epoch_loss):
+            epoch_loss = epoch_loss.item()
+        if epoch_loss is None:
+            epoch_loss = 0.0
+        self.epoch_metrics["loss"] = epoch_loss
         for metric_name, metric_value in self.epoch_metrics.items():
+            if torch.is_tensor(metric_value):
+                metric_value = metric_value.item()
             self.history[metric_name].append(metric_value)
         if self.verbose == 0:
             return
@@ -224,9 +240,20 @@ class History(Callback):
 
     def on_batch_end(self, batch, logs=None):
         batch_size = logs["batch_size"]
-        self.epoch_loss = (
-            self.samples_seen * self.epoch_loss + batch_size * logs["loss"]
-        ) / (self.samples_seen + batch_size)
+        loss = logs["loss"]
+        if torch.is_tensor(loss):
+            loss = loss.detach()
+            if self.epoch_loss is None:
+                self.epoch_loss = loss * 0
+            self.epoch_loss = (
+                self.samples_seen * self.epoch_loss + batch_size * loss
+            ) / (self.samples_seen + batch_size)
+        else:
+            if self.epoch_loss is None:
+                self.epoch_loss = 0.0
+            self.epoch_loss = (
+                self.samples_seen * self.epoch_loss + batch_size * loss
+            ) / (self.samples_seen + batch_size)
         self.samples_seen += batch_size
 
     def __getitem__(self, name):

@@ -3,6 +3,13 @@ from torch.nn import Linear, BatchNorm1d, ReLU
 import numpy as np
 from pytorch_tabnet import sparsemax
 
+try:
+    import cupy as cp
+    CUPY_AVAILABLE = True
+except Exception:
+    cp = None
+    CUPY_AVAILABLE = False
+
 
 def initialize_non_glu(module, input_dim, output_dim):
     gain_value = np.sqrt((input_dim + output_dim) / np.sqrt(4 * input_dim))

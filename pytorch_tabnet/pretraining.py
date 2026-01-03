@@ -7,7 +7,15 @@ from pytorch_tabnet.utils import (
     create_predict_dataloader,
     check_input,
     create_group_matrix,
+    get_xp,
+    to_cpu,
+    CUPY_AVAILABLE,
 )
+
+try:
+    import cupy as cp
+except Exception:
+    cp = None
 from torch.nn.utils import clip_grad_norm_
 from pytorch_tabnet.pretraining_utils import (
     create_dataloaders,
@@ -357,9 +365,14 @@ class TabNetPretrainer(TabModel):
         # Main loop
         for batch_idx, X in enumerate(loader):
             output, embedded_x, obf_vars = self._predict_batch(X)
-            list_output.append(output.cpu().detach().numpy())
-            list_embedded_x.append(embedded_x.cpu().detach().numpy())
-            list_obfuscation.append(obf_vars.cpu().detach().numpy())
+            if CUPY_AVAILABLE and self.device.type == 'cuda':
+                list_output.append(cp.from_dlpack(output.detach()))
+                list_embedded_x.append(cp.from_dlpack(embedded_x.detach()))
+                list_obfuscation.append(cp.from_dlpack(obf_vars.detach()))
+            else:
+                list_output.append(output.cpu().detach().numpy())
+                list_embedded_x.append(embedded_x.cpu().detach().numpy())
+                list_obfuscation.append(obf_vars.cpu().detach().numpy())
 
         output, embedded_x, obf_vars = self.stack_batches(list_output,
                                                           list_embedded_x,
@@ -392,9 +405,10 @@ class TabNetPretrainer(TabModel):
                 return self.network(X)
 
     def stack_batches(self, list_output, list_embedded_x, list_obfuscation):
-        output = np.vstack(list_output)
-        embedded_x = np.vstack(list_embedded_x)
-        obf_vars = np.vstack(list_obfuscation)
+        xp = get_xp()
+        output = xp.vstack(list_output)
+        embedded_x = xp.vstack(list_embedded_x)
+        obf_vars = xp.vstack(list_obfuscation)
         return output, embedded_x, obf_vars
 
     def predict(self, X):
@@ -421,6 +435,7 @@ class TabNetPretrainer(TabModel):
             device=self.device,
         )
 
+        xp = get_xp()
         results = []
         embedded_res = []
         with torch.inference_mode():
@@ -430,9 +445,14 @@ class TabNetPretrainer(TabModel):
                     data = data.float()
                 with self._autocast_context():
                     output, embeded_x, _ = self.network(data)
-                predictions = output.cpu().detach().numpy()
+                if CUPY_AVAILABLE and self.device.type == 'cuda':
+                    predictions = cp.from_dlpack(output.detach())
+                    embedded = cp.from_dlpack(embeded_x.detach())
+                else:
+                    predictions = output.cpu().detach().numpy()
+                    embedded = embeded_x.cpu().detach().numpy()
                 results.append(predictions)
-                embedded_res.append(embeded_x.cpu().detach().numpy())
-        res_output = np.vstack(results)
-        embedded_inputs = np.vstack(embedded_res)
+                embedded_res.append(embedded)
+        res_output = xp.vstack(results)
+        embedded_inputs = xp.vstack(embedded_res)
         return res_output, embedded_inputs

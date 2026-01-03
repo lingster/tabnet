@@ -12,6 +12,31 @@ from sklearn.metrics import (
 )
 import torch
 
+try:
+    import cupy as cp
+    CUPY_AVAILABLE = True
+except Exception:
+    cp = None
+    CUPY_AVAILABLE = False
+
+
+def get_xp(prefer_gpu=True):
+    """Get the array module to use (cupy if available and preferred, else numpy)."""
+    if prefer_gpu and CUPY_AVAILABLE:
+        return cp
+    return np
+
+
+def to_cpu(x):
+    """Move array to CPU (numpy) for sklearn compatibility."""
+    if isinstance(x, np.ndarray):
+        return x
+    if CUPY_AVAILABLE and isinstance(x, cp.ndarray):
+        return cp.asnumpy(x)
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
 
 def UnsupervisedLoss(y_pred, embedded_x, obf_vars, eps=1e-9):
     """
@@ -55,20 +80,26 @@ def UnsupervisedLoss(y_pred, embedded_x, obf_vars, eps=1e-9):
 
 
 def UnsupervisedLossNumpy(y_pred, embedded_x, obf_vars, eps=1e-9):
-    errors = y_pred - embedded_x
-    reconstruction_errors = np.multiply(errors, obf_vars) ** 2
-    batch_means = np.mean(embedded_x, axis=0)
-    batch_means = np.where(batch_means == 0, 1, batch_means)
+    xp = get_xp()
+    # Convert inputs to the active array module
+    y_pred = xp.asarray(y_pred)
+    embedded_x = xp.asarray(embedded_x)
+    obf_vars = xp.asarray(obf_vars)
 
-    batch_stds = np.std(embedded_x, axis=0, ddof=1) ** 2
-    batch_stds = np.where(batch_stds == 0, batch_means, batch_stds)
-    features_loss = np.matmul(reconstruction_errors, 1 / batch_stds)
+    errors = y_pred - embedded_x
+    reconstruction_errors = xp.multiply(errors, obf_vars) ** 2
+    batch_means = xp.mean(embedded_x, axis=0)
+    batch_means = xp.where(batch_means == 0, 1, batch_means)
+
+    batch_stds = xp.std(embedded_x, axis=0, ddof=1) ** 2
+    batch_stds = xp.where(batch_stds == 0, batch_means, batch_stds)
+    features_loss = xp.matmul(reconstruction_errors, 1 / batch_stds)
     # compute the number of obfuscated variables to reconstruct
-    nb_reconstructed_variables = np.sum(obf_vars, axis=1)
+    nb_reconstructed_variables = xp.sum(obf_vars, axis=1)
     # take the mean of the reconstructed variable errors
     features_loss = features_loss / (nb_reconstructed_variables + eps)
     # here we take the mean per batch, contrary to the paper
-    loss = np.mean(features_loss)
+    loss = float(xp.mean(features_loss))
     return loss
 
 
@@ -154,12 +185,13 @@ class MetricContainer:
             Dict of metrics ({metric_name: metric_value}).
 
         """
+        xp = get_xp()
         logs = {}
         for metric in self.metrics:
             if isinstance(y_pred, list):
-                res = np.mean(
+                res = float(xp.mean(xp.asarray(
                     [metric(y_true[:, i], y_pred[i]) for i in range(len(y_pred))]
-                )
+                )))
             else:
                 res = metric(y_true, y_pred)
             logs[self.prefix + metric._name] = res
@@ -253,8 +285,10 @@ class Accuracy(Metric):
         float
             Accuracy of predictions vs targets.
         """
-        y_pred = np.argmax(y_score, axis=1)
-        return accuracy_score(y_true, y_pred)
+        xp = get_xp()
+        y_pred = xp.argmax(xp.asarray(y_score), axis=1)
+        # sklearn requires CPU arrays
+        return accuracy_score(to_cpu(y_true), to_cpu(y_pred))
 
 
 class BalancedAccuracy(Metric):
@@ -282,8 +316,10 @@ class BalancedAccuracy(Metric):
         float
             Accuracy of predictions vs targets.
         """
-        y_pred = np.argmax(y_score, axis=1)
-        return balanced_accuracy_score(y_true, y_pred)
+        xp = get_xp()
+        y_pred = xp.argmax(xp.asarray(y_score), axis=1)
+        # sklearn requires CPU arrays
+        return balanced_accuracy_score(to_cpu(y_true), to_cpu(y_pred))
 
 
 class LogLoss(Metric):
@@ -329,9 +365,9 @@ class MAE(Metric):
 
         Parameters
         ----------
-        y_true : np.ndarray
+        y_true : np.ndarray or torch.Tensor
             Target matrix or vector
-        y_score : np.ndarray
+        y_score : np.ndarray or torch.Tensor
             Score matrix or vector
 
         Returns
@@ -339,6 +375,8 @@ class MAE(Metric):
         float
             MAE of predictions vs targets.
         """
+        if torch.is_tensor(y_true) and torch.is_tensor(y_score):
+            return torch.mean(torch.abs(y_true - y_score)).item()
         return mean_absolute_error(y_true, y_score)
 
 
@@ -357,9 +395,9 @@ class MSE(Metric):
 
         Parameters
         ----------
-        y_true : np.ndarray
+        y_true : np.ndarray or torch.Tensor
             Target matrix or vector
-        y_score : np.ndarray
+        y_score : np.ndarray or torch.Tensor
             Score matrix or vector
 
         Returns
@@ -367,6 +405,8 @@ class MSE(Metric):
         float
             MSE of predictions vs targets.
         """
+        if torch.is_tensor(y_true) and torch.is_tensor(y_score):
+            return torch.mean((y_true - y_score) ** 2).item()
         return mean_squared_error(y_true, y_score)
 
 
@@ -389,9 +429,9 @@ class RMSLE(Metric):
 
         Parameters
         ----------
-        y_true : np.ndarray
+        y_true : np.ndarray or torch.Tensor
             Target matrix or vector
-        y_score : np.ndarray
+        y_score : np.ndarray or torch.Tensor
             Score matrix or vector
 
         Returns
@@ -399,8 +439,13 @@ class RMSLE(Metric):
         float
             RMSLE of predictions vs targets.
         """
-        y_score = np.clip(y_score, a_min=0, a_max=None)
-        return np.sqrt(mean_squared_log_error(y_true, y_score))
+        if torch.is_tensor(y_true) and torch.is_tensor(y_score):
+            y_score = torch.clamp(y_score, min=0)
+            return torch.sqrt(torch.mean((torch.log1p(y_true) - torch.log1p(y_score)) ** 2)).item()
+        xp = get_xp()
+        y_score = xp.clip(xp.asarray(y_score), a_min=0, a_max=None)
+        # sklearn requires CPU arrays
+        return float(xp.sqrt(mean_squared_log_error(to_cpu(y_true), to_cpu(y_score))))
 
 
 class UnsupervisedMetric(Metric):
@@ -485,9 +530,9 @@ class RMSE(Metric):
 
         Parameters
         ----------
-        y_true : np.ndarray
+        y_true : np.ndarray or torch.Tensor
             Target matrix or vector
-        y_score : np.ndarray
+        y_score : np.ndarray or torch.Tensor
             Score matrix or vector
 
         Returns
@@ -495,7 +540,11 @@ class RMSE(Metric):
         float
             RMSE of predictions vs targets.
         """
-        return np.sqrt(mean_squared_error(y_true, y_score))
+        if torch.is_tensor(y_true) and torch.is_tensor(y_score):
+            return torch.sqrt(torch.mean((y_true - y_score) ** 2)).item()
+        xp = get_xp()
+        # sklearn requires CPU arrays
+        return float(xp.sqrt(mean_squared_error(to_cpu(y_true), to_cpu(y_score))))
 
 
 def check_metrics(metrics):
